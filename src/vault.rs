@@ -699,6 +699,70 @@ fn load_manifest(store_root: &Path, parity: &str) -> Result<Option<Manifest>> {
     Ok(Some(manifest))
 }
 
+/// A cheap, trust-preserving identity for a generation's manifest.
+///
+/// `exec --reuse` uses this after it has successfully restored and harvested
+/// a job once.  It deliberately does not parse every manifest entry: the
+/// private job state is only reusable while both the signed manifest bytes and
+/// the private MAC key are unchanged.  Metadata is mixed in as well, so a
+/// replacement with unusual timestamp preservation still falls back to the
+/// normal authenticated restore path.
+pub fn reuse_identity(store_root: &Path, parity: &str) -> Result<Option<String>> {
+    util::validate_component(parity, "generation")?;
+    if !store_root.exists() {
+        return Ok(None);
+    }
+    check_store_trust(store_root)?;
+    let path = manifest_path(store_root, parity);
+    let manifest_meta = match fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("inspecting {}", path.display())),
+    };
+    if !manifest_meta.is_file()
+        || manifest_meta.file_type().is_symlink()
+        || util::is_reparse_point(&manifest_meta)
+    {
+        anyhow::bail!("{} is not a regular manifest file", path.display());
+    }
+    ensure_manifest_size(manifest_meta.len())
+        .with_context(|| format!("reading {}", path.display()))?;
+    // Keep the same no-follow, ownership and mode checks as manifest loading.
+    let manifest = util::read_trusted_config(&path, MANIFEST_MAX_BYTES)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let key_path = manifest_key_path()?;
+    let key = read_key_file(&key_path)?;
+    let key_meta = fs::symlink_metadata(&key_path)
+        .with_context(|| format!("inspecting vault key {}", key_path.display()))?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"epicenter-reuse-identity-v1\0");
+    hash_identity_metadata(&mut hasher, &manifest_meta);
+    hasher.update(manifest.as_bytes());
+    hash_identity_metadata(&mut hasher, &key_meta);
+    hasher.update(&key);
+    Ok(Some(format!("{:x}", hasher.finalize())))
+}
+
+fn hash_identity_metadata(hasher: &mut Sha256, meta: &fs::Metadata) {
+    hasher.update(meta.len().to_le_bytes());
+    if let Ok(modified) = meta.modified()
+        && let Ok(duration) = modified.duration_since(UNIX_EPOCH)
+    {
+        hasher.update(duration.as_secs().to_le_bytes());
+        hasher.update(duration.subsec_nanos().to_le_bytes());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        hasher.update(meta.ino().to_le_bytes());
+        hasher.update(meta.ctime().to_le_bytes());
+        hasher.update(meta.ctime_nsec().to_le_bytes());
+        hasher.update(meta.mode().to_le_bytes());
+        hasher.update(meta.uid().to_le_bytes());
+    }
+}
+
 pub(crate) fn save_manifest(store_root: &Path, parity: &str, manifest: &Manifest) -> Result<()> {
     util::validate_component(parity, "generation")?;
     manifest
