@@ -2370,6 +2370,7 @@ mod tests {
                     size: 16,
                     sha256: "0".repeat(64),
                     role: "memo".into(),
+                    execute_bits: 0,
                 }],
             }],
             mac: String::new(),

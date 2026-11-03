@@ -1,5 +1,5 @@
 //! `epicenter exec` — run one command against a fresh per-job build dir
-//! seeded from the vault.
+//! seeded from verified private copies in the vault.
 //!
 //! A job gets its own directory under `{cargo-cache-home}/epicenter/work/<id>/`
 //! that plays the role of Cargo's build dir for the child process
@@ -23,6 +23,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::fingerprint;
 use crate::util::{self, GLYPH_FAIL, GLYPH_INFO, GLYPH_PASS, human_bytes, human_duration};
@@ -292,6 +294,13 @@ fn child_cargo(command: &[String]) -> (Option<String>, Option<String>) {
 /// workspace root). `None` means "cannot tell" — no lock yet, unreadable, or
 /// empty — and the caller keeps the whole-generation seed (fail-open).
 fn project_packages(cwd: &Path, command: &[String]) -> Option<HashSet<String>> {
+    let lock = project_lock_path(cwd, command)?;
+    parse_lock(&lock)
+}
+
+/// The workspace lock Cargo will use, honoring `--manifest-path` and walking
+/// upward from that manifest just as Cargo does for a crate subdirectory.
+fn project_lock_path(cwd: &Path, command: &[String]) -> Option<PathBuf> {
     let mut dir = manifest_arg(command)
         .map(|manifest| {
             let manifest = if manifest.is_absolute() {
@@ -308,7 +317,7 @@ fn project_packages(cwd: &Path, command: &[String]) -> Option<HashSet<String>> {
     loop {
         let lock = dir.join("Cargo.lock");
         if lock.is_file() {
-            return parse_lock(&lock);
+            return Some(lock);
         }
         dir = dir.parent()?.to_path_buf();
     }
@@ -338,6 +347,362 @@ fn parse_lock(path: &Path) -> Option<HashSet<String>> {
         .filter_map(|package| package.get("name")?.as_str().map(str::to_owned))
         .collect();
     (!names.is_empty()).then_some(names)
+}
+
+const REUSE_STATE_FILE: &str = ".epicenter-reuse-state.json";
+const REUSE_STATE_VERSION: u32 = 1;
+
+/// State written only after a child and its harvest both completed.  It is
+/// deliberately per job: it proves that this exact private build dir already
+/// reflects the vault generation and the Cargo command context below.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReuseState {
+    version: u32,
+    context: String,
+    vault_identity: String,
+    fingerprint: FingerprintSnapshot,
+}
+
+/// Metadata only, never artifact contents.  Cargo's memo/json/dep-info and
+/// invocation files are the authoritative freshness state, so their paths and
+/// metadata catch a source rebuild even when its memo hash did not change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct FingerprintSnapshot {
+    count: usize,
+    digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct FingerprintFile {
+    path: String,
+    len: u64,
+    modified_secs: u64,
+    modified_nanos: u32,
+    #[serde(default)]
+    inode: u64,
+    #[serde(default)]
+    ctime_secs: i64,
+    #[serde(default)]
+    ctime_nanos: i64,
+    #[serde(default)]
+    mode: u32,
+    #[serde(default)]
+    uid: u32,
+}
+
+fn reuse_state_path(work_dir: &Path) -> PathBuf {
+    work_dir.join(REUSE_STATE_FILE)
+}
+
+fn load_reuse_state(work_dir: &Path) -> Option<ReuseState> {
+    let text =
+        crate::util::read_trusted_config(&reuse_state_path(work_dir), 16 * 1024 * 1024).ok()?;
+    let state: ReuseState = serde_json::from_str(&text).ok()?;
+    (state.version == REUSE_STATE_VERSION).then_some(state)
+}
+
+fn save_reuse_state(work_dir: &Path, state: &ReuseState) -> Result<()> {
+    let bytes = serde_json::to_vec(state)?;
+    crate::util::write_atomic_private(&reuse_state_path(work_dir), &bytes)
+}
+
+fn harvest_synchronized(report: &vault::HarvestReport) -> bool {
+    // `skipped_*` may describe old diagnostic husks alongside a complete
+    // current build; `note` is the explicit wholesale refusal signal.
+    report.note.is_none()
+}
+
+/// File-valued `cargo --config` arguments. Inline `KEY=VALUE` settings are
+/// already part of argv; file paths are resolved from the child's cwd.
+fn command_config_paths(command: &[String], cwd: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut args = command.iter();
+    while let Some(arg) = args.next() {
+        let value = if arg == "--config" {
+            args.next().map(String::as_str)
+        } else {
+            arg.strip_prefix("--config=")
+        };
+        let Some(value) = value else { continue };
+        if value.contains('=') {
+            continue;
+        }
+        let path = PathBuf::from(value);
+        paths.push(if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        });
+    }
+    paths
+}
+
+fn reuse_context(
+    opts: &Options<'_>,
+    store_root: &Path,
+    parity: &str,
+    cargo_version: &str,
+    layout: fingerprint::UnitLayout,
+    target_dir: Option<&Path>,
+) -> String {
+    let project = project_dir(opts)
+        .and_then(|path| fs::canonicalize(path).ok())
+        .or_else(|| project_dir(opts))
+        .unwrap_or_default();
+    let lock = project_lock_path(&project, opts.command);
+    let lock_digest = lock
+        .as_deref()
+        .and_then(|lock| fs::read(lock).ok())
+        .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+        .unwrap_or_default();
+    let mut hasher = Sha256::new();
+    for value in [
+        "epicenter-reuse-context-v1",
+        &store_root.to_string_lossy(),
+        parity,
+        &project.to_string_lossy(),
+        &lock_digest,
+        cargo_version,
+        layout.label(),
+        target_dir
+            .map(|path| path.to_string_lossy())
+            .as_deref()
+            .unwrap_or(""),
+    ] {
+        hasher.update(value.as_bytes());
+        hasher.update([0]);
+    }
+    for arg in opts.command {
+        hasher.update(arg.as_bytes());
+        hasher.update([0]);
+    }
+    // Cargo/Rust environment controls are part of the command context.  Hash
+    // every one (including profile overrides) instead of maintaining a
+    // fragile allow-list.  The state stores only this digest, never values.
+    let mut environment: Vec<_> = std::env::vars_os()
+        .filter(|(name, _)| {
+            let name = name.as_encoded_bytes();
+            name.starts_with(b"CARGO_")
+                || name.starts_with(b"RUST")
+                || matches!(
+                    name,
+                    b"PATH" | b"CC" | b"CXX" | b"CFLAGS" | b"CXXFLAGS" | b"AR"
+                )
+                || name.starts_with(b"PKG_CONFIG_")
+        })
+        .collect();
+    environment.sort_by(|left, right| left.0.as_encoded_bytes().cmp(right.0.as_encoded_bytes()));
+    for (name, value) in environment {
+        hasher.update(name.as_encoded_bytes());
+        hasher.update([b'=']);
+        hasher.update(value.as_encoded_bytes());
+        hasher.update([0]);
+    }
+    let mut configs = Vec::new();
+    if let Ok(path) = crate::config::cargo_config_path() {
+        configs.push(path);
+    }
+    if let Ok(home) = crate::paths::cargo_home() {
+        // Cargo still recognizes the legacy filename when config.toml is not
+        // present, so it must invalidate the reuse context too.
+        configs.push(home.join("config"));
+    }
+    for ancestor in project.ancestors() {
+        configs.push(ancestor.join(".cargo/config.toml"));
+        configs.push(ancestor.join(".cargo/config"));
+    }
+    configs.extend(command_config_paths(opts.command, &project));
+    for config in configs {
+        hasher.update(config.as_os_str().as_encoded_bytes());
+        hasher.update([b'=']);
+        if let Ok(bytes) = fs::read(&config) {
+            hasher.update(Sha256::digest(bytes));
+        }
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// Return the recognized profile directories directly below `root` or one
+/// target-triple directory below it.  This never walks `deps/` or `out/`.
+fn snapshot_profiles(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut profiles = Vec::new();
+    let entries = fs::read_dir(root).with_context(|| format!("reading {}", root.display()))?;
+    for entry in entries {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            bail!("build state contains a symlink: {}", entry.path().display());
+        }
+        let meta = entry.metadata()?;
+        if crate::util::is_reparse_point(&meta) {
+            bail!(
+                "build state contains a reparse point: {}",
+                entry.path().display()
+            );
+        }
+        if !meta.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        if real_dir(&path.join(".fingerprint"))? || real_dir(&path.join("build"))? {
+            profiles.push(path.clone());
+        }
+        for child in fs::read_dir(&path)? {
+            let child = child?;
+            let file_type = child.file_type()?;
+            if file_type.is_symlink() {
+                bail!("build state contains a symlink: {}", child.path().display());
+            }
+            let meta = child.metadata()?;
+            if crate::util::is_reparse_point(&meta) {
+                bail!(
+                    "build state contains a reparse point: {}",
+                    child.path().display()
+                );
+            }
+            if !meta.is_dir() {
+                continue;
+            }
+            let child = child.path();
+            if real_dir(&child.join(".fingerprint"))? || real_dir(&child.join("build"))? {
+                profiles.push(child);
+            }
+        }
+    }
+    profiles.sort();
+    profiles.dedup();
+    Ok(profiles)
+}
+
+fn real_dir(path: &Path) -> Result<bool> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err).with_context(|| format!("inspecting {}", path.display())),
+    };
+    if meta.file_type().is_symlink() || crate::util::is_reparse_point(&meta) {
+        bail!("build state contains a link: {}", path.display());
+    }
+    Ok(meta.is_dir())
+}
+
+fn snapshot_fingerprint_dir(
+    root: &Path,
+    dir: &Path,
+    files: &mut Vec<FingerprintFile>,
+) -> Result<()> {
+    let root_meta = fs::symlink_metadata(dir)?;
+    if !root_meta.is_dir()
+        || root_meta.file_type().is_symlink()
+        || crate::util::is_reparse_point(&root_meta)
+    {
+        bail!(
+            "fingerprint state {} is not a real directory",
+            dir.display()
+        );
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let meta = entry.metadata()?;
+        if !meta.is_file()
+            || entry.file_type()?.is_symlink()
+            || crate::util::is_reparse_point(&meta)
+        {
+            bail!(
+                "fingerprint state {} is not a regular file",
+                entry.path().display()
+            );
+        }
+        let modified = meta.modified()?.duration_since(UNIX_EPOCH)?;
+        let mut record = FingerprintFile {
+            path: entry
+                .path()
+                .strip_prefix(root)?
+                .to_string_lossy()
+                .replace('\\', "/"),
+            len: meta.len(),
+            modified_secs: modified.as_secs(),
+            modified_nanos: modified.subsec_nanos(),
+            inode: 0,
+            ctime_secs: 0,
+            ctime_nanos: 0,
+            mode: 0,
+            uid: 0,
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            record.inode = meta.ino();
+            record.ctime_secs = meta.ctime();
+            record.ctime_nanos = meta.ctime_nsec();
+            record.mode = meta.mode();
+            record.uid = meta.uid();
+        }
+        files.push(record);
+    }
+    Ok(())
+}
+
+fn fingerprint_snapshot(
+    root: &Path,
+    layout: fingerprint::UnitLayout,
+) -> Result<FingerprintSnapshot> {
+    let mut files = Vec::new();
+    for profile in snapshot_profiles(root)? {
+        match layout {
+            fingerprint::UnitLayout::Classic => {
+                let dir = profile.join(".fingerprint");
+                if !real_dir(&dir)? {
+                    continue;
+                }
+                for unit in fs::read_dir(dir)? {
+                    let unit = unit?;
+                    snapshot_fingerprint_dir(root, &unit.path(), &mut files)?;
+                }
+            }
+            fingerprint::UnitLayout::New => {
+                let build = profile.join("build");
+                if !real_dir(&build)? {
+                    continue;
+                }
+                for package in fs::read_dir(build)? {
+                    let package = package?;
+                    if !real_dir(&package.path())? {
+                        bail!(
+                            "new-layout package is not a real directory: {}",
+                            package.path().display()
+                        );
+                    }
+                    for unit in fs::read_dir(package.path())? {
+                        let unit = unit?;
+                        if !real_dir(&unit.path())? {
+                            bail!(
+                                "new-layout unit is not a real directory: {}",
+                                unit.path().display()
+                            );
+                        }
+                        let dir = unit.path().join("fingerprint");
+                        if real_dir(&dir)? {
+                            snapshot_fingerprint_dir(root, &dir, &mut files)?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    let mut hasher = Sha256::new();
+    hasher.update(b"epicenter-fingerprint-state-v1\0");
+    for file in &files {
+        let bytes = serde_json::to_vec(file)?;
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+    Ok(FingerprintSnapshot {
+        count: files.len(),
+        digest: format!("{:x}", hasher.finalize()),
+    })
 }
 
 /// Run the job; returns the command's exit code.
@@ -391,6 +756,9 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
     } else {
         crate::util::create_private_dir_all(&work_dir)?;
     }
+    // `restore_with` normally performs this check.  Keep it on the no-op
+    // path too: a reuse marker never authorizes a shared or replaced view.
+    crate::util::ensure_private_dir(&work_dir)?;
     let target_dir = opts
         .target_dir
         .map(|raw| resolve_target_dir(raw, &work_dir, opts.cwd.as_deref()));
@@ -424,37 +792,80 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
     let layout = cargo_version
         .as_deref()
         .map(|version| fingerprint::layout_for_cargo(version, opts.command));
-    let restore = vault::restore_with(
-        &work_dir,
-        store_root,
-        None,
-        packages.as_ref(),
-        layout,
-        selector.as_deref(),
-        false,
-    )?;
-    if restore.fatal_errors > 0 {
-        bail!(
-            "vault restore refused {} unverified file(s) — refusing to run the command over unverified state",
-            restore.fatal_errors
-        );
+    // A job becomes eligible only after a successful child plus harvest.  The
+    // state includes the manifest/key identity and Cargo fingerprint metadata;
+    // any missing or changed input returns to the normal verified path.
+    let reuse_context = match (opts.harvest_back, layout, cargo_version.as_deref()) {
+        (true, Some(layout), Some(version)) => Some((
+            vault::parity_key_of(selector.as_deref())?,
+            reuse_context(
+                opts,
+                store_root,
+                &vault::parity_key_of(selector.as_deref())?,
+                version,
+                layout,
+                target_dir.as_deref(),
+            ),
+            layout,
+        )),
+        _ => None,
+    };
+    let mut reuse_fast_path = false;
+    let mut fast_state = None;
+    let mut before_fingerprint = None;
+    if opts.reuse
+        && let Some((parity, context, layout)) = &reuse_context
+        && let Some(state) = load_reuse_state(&work_dir)
+        && state.context == *context
+        && let Ok(snapshot) = fingerprint_snapshot(&work_dir, *layout)
+        && snapshot == state.fingerprint
+    {
+        // An identity read keeps the store/key trust checks active without
+        // reparsing every unit or scanning its artifacts.
+        if vault::reuse_identity(store_root, parity)? == Some(state.vault_identity.clone()) {
+            reuse_fast_path = true;
+            before_fingerprint = Some(snapshot);
+            fast_state = Some(state);
+            eprintln!(
+                "  {} ready — verified prior state; restore scan skipped",
+                util::dim(&format!("{:<11}", "reuse"))
+            );
+        }
     }
-    match &restore.note {
-        Some(_) if opts.harvest_back => eprintln!(
-            "  {} cold start — the vault has nothing for this generation yet; --harvest will store what this job builds",
-            util::info(GLYPH_INFO)
-        ),
-        Some(_) => eprintln!(
-            "  {} cold start — the vault has nothing for this generation yet; pass --harvest to seed it from this job",
-            util::info(GLYPH_INFO)
-        ),
-        None => eprintln!(
-            "  {} {} unit(s) · {} file(s) · {}",
-            util::dim(&format!("{:<11}", "vault")),
-            restore.units_linked,
-            restore.files_linked + restore.files_copied,
-            util::green(&human_bytes(restore.bytes))
-        ),
+    if !reuse_fast_path {
+        let restore = vault::restore_with(
+            &work_dir,
+            store_root,
+            None,
+            packages.as_ref(),
+            layout,
+            selector.as_deref(),
+            false,
+        )?;
+        if restore.fatal_errors > 0 {
+            bail!(
+                "vault restore refused {} unverified file(s) — refusing to run the command over unverified state",
+                restore.fatal_errors
+            );
+        }
+        match &restore.note {
+            Some(_) if opts.harvest_back => eprintln!(
+                "  {} cold start — the vault has nothing for this generation yet; --harvest will store what this job builds",
+                util::info(GLYPH_INFO)
+            ),
+            Some(_) => eprintln!(
+                "  {} cold start — the vault has nothing for this generation yet; pass --harvest to seed it from this job",
+                util::info(GLYPH_INFO)
+            ),
+            None => eprintln!(
+                "  {} {} unit(s) · {} file(s) · {}",
+                util::dim(&format!("{:<11}", "vault")),
+                restore.units_linked,
+                restore.files_linked + restore.files_copied,
+                util::green(&human_bytes(restore.bytes))
+            ),
+        }
+        before_fingerprint = layout.and_then(|layout| fingerprint_snapshot(&work_dir, layout).ok());
     }
     eprintln!(
         "  {} CARGO_BUILD_BUILD_DIR (this job only; no config change)",
@@ -477,6 +888,19 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
         );
     }
     drop(reuse_locks);
+    // From this point a child may mutate the view or fail to start.  Remove
+    // the old proof first and recreate it only after the complete successful
+    // path below.
+    if opts.reuse {
+        match fs::remove_file(reuse_state_path(&work_dir)) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("removing reuse state for {}", work_dir.display()));
+            }
+        }
+    }
     eprintln!("{}", util::dim("  ── command ──"));
     let _ = std::io::stderr().flush();
 
@@ -496,7 +920,20 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
     let elapsed = started.elapsed();
     let code = exit_code(&status);
 
-    let harvested = if opts.harvest_back {
+    let after_fingerprint = layout.and_then(|layout| fingerprint_snapshot(&work_dir, layout).ok());
+    let harvest_skipped = if reuse_fast_path && code == 0 {
+        match (&reuse_context, &before_fingerprint, &after_fingerprint) {
+            (Some((parity, _, _)), Some(before), Some(after)) if before == after => {
+                // Another job may have published while the child ran.  Do not
+                // call this a no-op until the exact prior identity still holds.
+                matches!(&fast_state, Some(state) if vault::reuse_identity(store_root, parity).ok().flatten() == Some(state.vault_identity.clone()))
+            }
+            _ => false,
+        }
+    } else {
+        false
+    };
+    let harvested = if opts.harvest_back && !harvest_skipped {
         Some(vault::harvest_with(
             &work_dir,
             store_root,
@@ -508,6 +945,39 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
     } else {
         None
     };
+    if code == 0
+        && opts.harvest_back
+        && !harvest_skipped
+        && let (Some((parity, context, _)), Some(fingerprint), Some(report)) =
+            (&reuse_context, &after_fingerprint, &harvested)
+        && harvest_synchronized(report)
+        && let Some(vault_identity) = vault::reuse_identity(store_root, parity)?
+    {
+        if let Err(err) = save_reuse_state(
+            &work_dir,
+            &ReuseState {
+                version: REUSE_STATE_VERSION,
+                context: context.clone(),
+                vault_identity,
+                fingerprint: fingerprint.clone(),
+            },
+        ) {
+            eprintln!(
+                "  {} could not save reuse state: {err:#}",
+                util::warn(util::GLYPH_WARN)
+            );
+        }
+    } else if harvest_skipped
+        && code == 0
+        && let Some(state) = &fast_state
+    {
+        if let Err(err) = save_reuse_state(&work_dir, state) {
+            eprintln!(
+                "  {} could not save reuse state: {err:#}",
+                util::warn(util::GLYPH_WARN)
+            );
+        }
+    }
     let mut removed = false;
     let mut remove_error = None;
     if opts.remove_on_success {
@@ -539,6 +1009,11 @@ pub fn run(store_root: &Path, work_root: &Path, opts: &Options<'_>) -> Result<i3
             }
             eprintln!("  {} {line}", util::dim(&format!("{:<11}", "harvest")));
         }
+    } else if harvest_skipped {
+        eprintln!(
+            "  {} unchanged fingerprint state — harvest scan skipped",
+            util::dim(&format!("{:<11}", "harvest"))
+        );
     }
     if removed {
         eprintln!(
@@ -993,6 +1468,214 @@ mod tests {
         assert!(
             dir_locked(&home.path().join("cross")),
             "target-triple lock must be found"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fingerprint_snapshot_detects_a_same_content_memo_rewrite() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let unit = root
+            .path()
+            .join("release/.fingerprint/demo-0123456789abcdef");
+        fs::create_dir_all(&unit)?;
+        let memo = unit.join("lib-demo");
+        fs::write(&memo, "0123456789abcdef")?;
+        let before = fingerprint_snapshot(root.path(), fingerprint::UnitLayout::Classic)?;
+
+        // Cargo may preserve the memo hash while refreshing invocation state.
+        // A metadata-only snapshot must still force harvest in that case.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        fs::write(&memo, "0123456789abcdef")?;
+        let after = fingerprint_snapshot(root.path(), fingerprint::UnitLayout::Classic)?;
+        assert_ne!(before, after, "a rewritten memo must not look like a no-op");
+        Ok(())
+    }
+
+    #[test]
+    fn project_lock_path_follows_a_workspace_from_a_member() -> Result<()> {
+        let project = tempfile::tempdir()?;
+        let member = project.path().join("crates/member");
+        fs::create_dir_all(&member)?;
+        let lock = project.path().join("Cargo.lock");
+        fs::write(&lock, "version = 4\n")?;
+        assert_eq!(
+            project_lock_path(&member, &["cargo".into(), "check".into()]),
+            Some(lock)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reuse_context_tracks_external_cargo_config_contents() -> Result<()> {
+        let project = tempfile::tempdir()?;
+        let config = project.path().join("cargo-extra.toml");
+        fs::write(&config, "[build]\ntarget = 'first'\n")?;
+        let command = vec![
+            "cargo".into(),
+            "--config".into(),
+            "cargo-extra.toml".into(),
+            "build".into(),
+        ];
+        let opts = Options {
+            job_id: None,
+            cwd: Some(project.path().to_path_buf()),
+            harvest_back: true,
+            remove_on_success: false,
+            reuse: true,
+            target_dir: None,
+            command: &command,
+        };
+        let first = reuse_context(
+            &opts,
+            Path::new("/cache/store"),
+            "parity",
+            "cargo 1.98.0",
+            fingerprint::UnitLayout::Classic,
+            None,
+        );
+        fs::write(&config, "[build]\ntarget = 'second'\n")?;
+        let second = reuse_context(
+            &opts,
+            Path::new("/cache/store"),
+            "parity",
+            "cargo 1.98.0",
+            fingerprint::UnitLayout::Classic,
+            None,
+        );
+        assert_ne!(
+            first, second,
+            "external --config contents are part of context"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn diagnostic_husks_do_not_block_a_successful_reuse_marker() {
+        let diagnostic = vault::HarvestReport {
+            skipped_incomplete: 1,
+            ..Default::default()
+        };
+        assert!(harvest_synchronized(&diagnostic));
+        let refused = vault::HarvestReport {
+            note: Some("stale toolchain".into()),
+            ..Default::default()
+        };
+        assert!(!harvest_synchronized(&refused));
+    }
+
+    #[test]
+    fn reuse_state_stays_small_for_large_fingerprint_sets() -> Result<()> {
+        let state = ReuseState {
+            version: REUSE_STATE_VERSION,
+            context: "context".into(),
+            vault_identity: "identity".into(),
+            fingerprint: FingerprintSnapshot {
+                count: 50_000,
+                digest: "a".repeat(64),
+            },
+        };
+        let encoded = serde_json::to_vec(&state)?;
+        assert!(
+            encoded.len() < 512,
+            "state contains a digest, not every file"
+        );
+        assert!(!String::from_utf8_lossy(&encoded).contains("files"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exec_reuse_state_skips_only_unchanged_successful_jobs() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_build, store) = seeded_store()?;
+        let work = tempfile::tempdir()?;
+        let project = tempfile::tempdir()?;
+        fs::write(
+            project.path().join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"x\"\nversion = \"1.0.0\"\n",
+        )?;
+        let cargo = project.path().join("cargo");
+        fs::write(
+            &cargo,
+            "#!/bin/sh\n\
+             if [ \"$1\" = --version ]; then echo 'cargo 1.98.0'; exit 0; fi\n\
+             case \"$(cat mode)\" in\n\
+               rewrite) sleep 1; printf aaaabbbbccccdddd > \"$CARGO_BUILD_BUILD_DIR/debug/.fingerprint/x-1122334455667788/lib-x\"; printf 22222222 > \"$CARGO_BUILD_BUILD_DIR/debug/deps/libx-1122334455667788.rlib\" ;;\n\
+               fail) exit 4 ;;\n\
+             esac\n",
+        )?;
+        fs::set_permissions(&cargo, fs::Permissions::from_mode(0o700))?;
+        fs::write(project.path().join("mode"), "noop")?;
+        let parity = vault::parity_key()?;
+        let manifest = store.path().join(&parity).join("manifest.json");
+        let job = work.path().join("agent");
+
+        let command = vec![cargo.display().to_string(), "build".into()];
+        let first = Options {
+            job_id: Some("agent"),
+            cwd: Some(project.path().to_path_buf()),
+            harvest_back: true,
+            remove_on_success: false,
+            reuse: false,
+            target_dir: None,
+            command: &command,
+        };
+        assert_eq!(run(store.path(), work.path(), &first)?, 0);
+        assert!(
+            reuse_state_path(&job).is_file(),
+            "first harvest writes proof"
+        );
+
+        let before_warm = fs::metadata(&manifest)?.modified()?;
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let warm = Options {
+            job_id: Some("agent"),
+            cwd: Some(project.path().to_path_buf()),
+            harvest_back: true,
+            remove_on_success: false,
+            reuse: true,
+            target_dir: None,
+            command: &command,
+        };
+        assert_eq!(run(store.path(), work.path(), &warm)?, 0);
+        assert_eq!(
+            fs::metadata(&manifest)?.modified()?,
+            before_warm,
+            "warm job skips harvest"
+        );
+        assert!(
+            reuse_state_path(&job).is_file(),
+            "successful no-op restores proof"
+        );
+
+        fs::write(project.path().join("mode"), "rewrite")?;
+        assert_eq!(run(store.path(), work.path(), &warm)?, 0);
+        let after_rewrite = fs::metadata(&manifest)?.modified()?;
+        assert!(after_rewrite > before_warm, "rewritten memo forces harvest");
+
+        // A build outside `epicenter exec` changes the metadata snapshot, so
+        // the next reuse falls back to normal harvest even though the child is
+        // otherwise a no-op.
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        fs::write(project.path().join("mode"), "noop")?;
+        fs::write(
+            job.join("debug/.fingerprint/x-1122334455667788/lib-x"),
+            "aaaabbbbccccdddd",
+        )?;
+        assert_eq!(run(store.path(), work.path(), &warm)?, 0);
+        let after_external = fs::metadata(&manifest)?.modified()?;
+        assert!(
+            after_external > after_rewrite,
+            "external state forces harvest"
+        );
+
+        fs::write(project.path().join("mode"), "fail")?;
+        assert_eq!(run(store.path(), work.path(), &warm)?, 4);
+        assert!(
+            !reuse_state_path(&job).exists(),
+            "a failing child must invalidate its old reuse proof"
         );
         Ok(())
     }
