@@ -2,6 +2,16 @@
 
 *Requires Cargo with `build.build-dir` support — Rust 1.91+.*
 
+> This fork preserves executable permissions and restores verified artifacts as
+> private writable copies, allowing Cargo to rebuild cached units without changing
+> the vault. It also uses a shared 256 MiB manifest read/write limit and excludes
+> incomplete fingerprints from harvest. Cache reuse remains supported, but the
+> upstream hard-link disk-saving claims below do not apply to restored work views.
+>
+> Existing views created by older versions may still contain read-only hard links.
+> Recreate those disposable views from the vault before rebuilding; upgrading does
+> not migrate existing views automatically.
+
 Rust has two main problems: slow compilation times and big target directories.
 This usually means that every Cargo project compiles its dependencies into its own `target/` directory:
 ten projects = ten copies of the same rlibs, consuming gigabytes of storage.

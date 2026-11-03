@@ -25,8 +25,8 @@
 //! (`stamp`): the ceiling of the group's metadata output (`.rmeta`) when it
 //! has one — the moment dependents can compile against it — else of its
 //! newest file, and always ≥ every dependency's stamp (harvest clamps the
-//! store). Restore never stamps hard links: they share the store's inode,
-//! and a `touch` on a restored file would rewrite the store itself.
+//! store). Restore verifies and copies every file into its working view, so
+//! Cargo can rebuild without changing the immutable vault.
 
 use std::fs;
 use std::io::Write;
@@ -393,6 +393,18 @@ fn ensure_store_root(store_root: &Path) -> Result<()> {
 
 // ── manifest ────────────────────────────────────────────────────────────────
 
+/// The vault manifest records every file in a harvested generation. Large
+/// workspaces can legitimately produce tens of MiB of entries, but a bound
+/// still prevents an untrusted file from causing an unbounded allocation.
+const MANIFEST_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+fn ensure_manifest_size(bytes: u64) -> Result<()> {
+    if bytes > MANIFEST_MAX_BYTES {
+        anyhow::bail!("manifest is {bytes} bytes, exceeding the {MANIFEST_MAX_BYTES}-byte limit");
+    }
+    Ok(())
+}
+
 /// `manifest.json` of one generation.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Manifest {
@@ -464,6 +476,14 @@ pub struct FileEntry {
     pub sha256: String,
     /// `memo` | `fingerprint` | `dep-info` | `artifact` | `build-tree`.
     pub role: String,
+    /// Unix executable bits from the source file. Kept out of legacy
+    /// manifests when zero so their signed representation stays unchanged.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub execute_bits: u32,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 impl Manifest {
@@ -485,6 +505,14 @@ impl Manifest {
                         || !file.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()))
                 {
                     anyhow::bail!("invalid SHA-256 for {} in unit {}", file.path, unit.name);
+                }
+                if file.execute_bits & !0o111 != 0 {
+                    anyhow::bail!(
+                        "invalid executable bits {:o} for {} in unit {}",
+                        file.execute_bits,
+                        file.path,
+                        unit.name
+                    );
                 }
             }
         }
@@ -650,7 +678,8 @@ fn load_manifest(store_root: &Path, parity: &str) -> Result<Option<Manifest>> {
             );
         }
     }
-    let text = crate::util::read_trusted_config(&path, 16 * 1024 * 1024)
+    ensure_manifest_size(meta.len()).with_context(|| format!("reading {}", path.display()))?;
+    let text = crate::util::read_trusted_config(&path, MANIFEST_MAX_BYTES)
         .with_context(|| format!("reading {}", path.display()))?;
     let manifest: Manifest =
         serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
@@ -672,12 +701,25 @@ fn load_manifest(store_root: &Path, parity: &str) -> Result<Option<Manifest>> {
 
 pub(crate) fn save_manifest(store_root: &Path, parity: &str, manifest: &Manifest) -> Result<()> {
     util::validate_component(parity, "generation")?;
+    manifest
+        .validate()
+        .context("refusing to save an invalid manifest")?;
     let dir = store_root.join(parity);
     util::create_private_dir_all(&dir)?;
     let mut signed = manifest.clone();
     signed.mac.clear();
     signed.mac = manifest_mac(&signed)?;
     let what = serde_json::to_string_pretty(&signed)?;
+    let serialized_size = u64::try_from(what.len())
+        .expect("serialized manifest length fits in u64")
+        .checked_add(1)
+        .expect("serialized manifest length fits in u64");
+    ensure_manifest_size(serialized_size).with_context(|| {
+        format!(
+            "refusing to save manifest {}",
+            manifest_path(store_root, parity).display()
+        )
+    })?;
     // O_EXCL + a symlink-free path: never write through a planted temp link.
     let mut tmp = None;
     for attempt in 0..100u32 {
@@ -1055,6 +1097,17 @@ pub fn harvest_with(
             report.skipped_stale += 1;
             continue;
         }
+        let Some(hash) = unit
+            .memo_hash
+            .as_deref()
+            .filter(|hash| fingerprint::looks_like_hash(hash))
+        else {
+            // `pick_memo` retains diagnostic-only fingerprint dirs for
+            // inspection. They are not a Cargo unit and cannot enter a
+            // signed manifest, whose hash is an invariant.
+            report.skipped_incomplete += 1;
+            continue;
+        };
 
         let unit_dir = &unit.fingerprint_dir;
         let profile_dir = build_root.join(&unit.profile);
@@ -1138,7 +1191,7 @@ pub fn harvest_with(
         plans.push(GroupPlan {
             base: group_stamp(&files)?,
             memo,
-            hash: unit.memo_hash.clone().unwrap_or_default(),
+            hash: hash.to_owned(),
             files,
             unit: unit.clone(),
         });
@@ -1222,22 +1275,37 @@ pub fn harvest_with(
         let stamp = stamps[at];
         let group_dir = units_dir(store_root, &parity).join(&unit.dir_name);
 
-        // Unchanged = same hash, profile and stamp, same (path, role) file
-        // set, all present. Anything else is refreshed as a whole group.
-        let mut new_entries: Vec<(&str, &str, &str)> = files
+        // Unchanged = same hash, profile and stamp, same (path, role,
+        // executable bits) file set, all present. Anything else is refreshed
+        // as a whole group.
+        let mut new_entries: Vec<(&str, &str, &str, u32)> = files
             .iter()
-            .map(|(_, path, dest, role)| (path.as_str(), dest.as_str(), role.as_str()))
-            .collect();
+            .map(|(src, path, dest, role)| {
+                Ok((
+                    path.as_str(),
+                    dest.as_str(),
+                    role.as_str(),
+                    source_execute_bits(src)?,
+                ))
+            })
+            .collect::<Result<_>>()?;
         new_entries.sort_unstable();
         let already = manifest
             .units
             .iter()
             .find(|entry| entry.name == unit.dir_name)
             .map(|entry| {
-                let mut stored: Vec<(&str, &str, &str)> = entry
+                let mut stored: Vec<(&str, &str, &str, u32)> = entry
                     .files
                     .iter()
-                    .map(|file| (file.path.as_str(), file.dest.as_str(), file.role.as_str()))
+                    .map(|file| {
+                        (
+                            file.path.as_str(),
+                            file.dest.as_str(),
+                            file.role.as_str(),
+                            file.execute_bits,
+                        )
+                    })
                     .collect();
                 stored.sort_unstable();
                 entry.hash == plan.hash
@@ -1414,17 +1482,20 @@ fn stage_group(
         if let Some(parent) = dst.parent() {
             util::create_private_dir_all(parent)?;
         }
+        let execute_bits = source_execute_bits(src)?;
         let (size, sha256) = util::copy_file_hashed(src, &dst)
             .with_context(|| format!("copying {} -> {}", src.display(), dst.display()))?;
-        make_writable(&dst).with_context(|| format!("making {} writable", dst.display()))?;
+        make_writable(&dst, execute_bits)
+            .with_context(|| format!("making {} writable", dst.display()))?;
         set_stamp(&dst, stamp)?;
-        make_read_only(&dst)?;
+        make_read_only(&dst, execute_bits)?;
         entries.push(FileEntry {
             path: path.clone(),
             dest: dest.clone(),
             size,
             sha256,
             role: role.clone(),
+            execute_bits,
         });
     }
     Ok(())
@@ -1540,17 +1611,32 @@ fn set_stamp(path: &Path, stamp: u64) -> Result<()> {
     Ok(())
 }
 
+/// Preserve only ordinary execute bits. Writable/read-only normalization drops
+/// setuid, setgid and sticky bits unconditionally.
+#[cfg(unix)]
+fn normalized_file_mode(execute_bits: u32, writable: bool) -> u32 {
+    (if writable { 0o644 } else { 0o444 }) | execute_bits
+}
+
+/// Private restore copies may be rewritten by Cargo, but never need
+/// group/world access.
+#[cfg(unix)]
+fn private_restore_mode(execute_bits: u32) -> u32 {
+    0o600 | execute_bits
+}
+
 /// The store is read-only by contract; restored state must not be.
 #[cfg(unix)]
-fn make_writable(path: &Path) -> std::io::Result<()> {
+fn make_writable(path: &Path, execute_bits: u32) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let mut perms = fs::metadata(path)?.permissions();
-    perms.set_mode(0o644);
-    fs::set_permissions(path, perms)
+    fs::set_permissions(
+        path,
+        fs::Permissions::from_mode(normalized_file_mode(execute_bits, true)),
+    )
 }
 
 #[cfg(not(unix))]
-fn make_writable(path: &Path) -> std::io::Result<()> {
+fn make_writable(path: &Path, _execute_bits: u32) -> std::io::Result<()> {
     let mut perms = fs::metadata(path)?.permissions();
     perms.set_readonly(false);
     fs::set_permissions(path, perms)
@@ -1559,17 +1645,39 @@ fn make_writable(path: &Path) -> std::io::Result<()> {
 /// On Unix the store is read-only (owner can still stamp and delete; only
 /// content edits are refused). On Windows a read-only file blocks rename
 /// and delete, so the store keeps normal permissions there.
-fn make_read_only(path: &Path) -> Result<()> {
+fn make_read_only(path: &Path, execute_bits: u32) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o444))?;
+        fs::set_permissions(
+            path,
+            fs::Permissions::from_mode(normalized_file_mode(execute_bits, false)),
+        )?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, execute_bits);
+    }
+    Ok(())
+}
+
+/// Return only the Unix execution bits. Read, write and special bits are
+/// deliberately reconstructed from fixed modes when a file enters the vault.
+fn source_execute_bits(path: &Path) -> Result<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        Ok(fs::symlink_metadata(path)
+            .with_context(|| format!("inspecting permissions of {}", path.display()))?
+            .permissions()
+            .mode()
+            & 0o111)
     }
     #[cfg(not(unix))]
     {
         let _ = path;
+        Ok(0)
     }
-    Ok(())
 }
 
 /// Files that never enter the store: the volatile invocation timestamp,
@@ -1604,14 +1712,13 @@ pub struct RestoreReport {
 enum RestoreOutcome {
     Existing,
     Missing,
-    Linked,
     Copied,
 }
 
 /// fd-relative restore on Unix: destination parents are opened with
-/// openat(O_NOFOLLOW), the source inode is opened once, and the final name is
-/// installed with linkat. No path component can be swapped for a symlink
-/// after the check.
+/// openat(O_NOFOLLOW), and the final file is created through the held parent
+/// descriptor. No path component can be swapped for a symlink after the
+/// check.
 #[cfg(unix)]
 fn restore_file_at(
     view_root: &Path,
@@ -1619,7 +1726,6 @@ fn restore_file_at(
     src: &Path,
     stamp: u64,
     file: &FileEntry,
-    shared: bool,
 ) -> Result<RestoreOutcome> {
     let parent_rel = dest_rel.parent().unwrap_or_else(|| Path::new(""));
     let dst_name = dest_rel
@@ -1660,42 +1766,35 @@ fn restore_file_at(
             meta.len()
         );
     }
-    if shared {
-        if file.sha256.is_empty() {
-            anyhow::bail!("{} has no recorded SHA-256", src.display());
-        }
-        let found = util::sha256_file_fd(&mut source)?;
-        if found != file.sha256 {
-            anyhow::bail!("{} failed its SHA-256 check", src.display());
-        }
-        parent.link_path(src, dst_name)?;
-        Ok(RestoreOutcome::Linked)
-    } else {
-        // Write the private copy directly at the final name with O_EXCL. The
-        // destination name is created once, at the held parent fd; on any
-        // integrity/stamp failure the partial file is removed. No temp-path
-        // lookup is needed, which keeps this portable on non-Linux Unix.
-        let mut tmp = parent.create_excl(dst_name, 0o600)?;
-        let result = util::copy_fd_verified(&mut source, &mut tmp, file.size, &file.sha256)
-            .and_then(|_| util::set_stamp_fd(&tmp, stamp).map_err(anyhow::Error::from));
-        if let Err(err) = result {
-            let _ = parent.unlink(dst_name);
-            return Err(err);
-        }
-        Ok(RestoreOutcome::Copied)
+    // Write the private copy directly at the final name with O_EXCL. The
+    // destination name is created once, at the held parent fd; on any
+    // integrity/stamp failure the partial file is removed. No temp-path
+    // lookup is needed, which keeps this portable on non-Linux Unix.
+    let mut tmp = parent.create_excl(dst_name, private_restore_mode(file.execute_bits))?;
+    let result = util::copy_fd_verified(&mut source, &mut tmp, file.size, &file.sha256)
+        .and_then(|_| util::set_stamp_fd(&tmp, stamp).map_err(anyhow::Error::from))
+        .and_then(|_| {
+            use std::os::unix::fs::PermissionsExt;
+            tmp.set_permissions(fs::Permissions::from_mode(private_restore_mode(
+                file.execute_bits,
+            )))
+            .map_err(anyhow::Error::from)
+        });
+    if let Err(err) = result {
+        let _ = parent.unlink(dst_name);
+        return Err(err);
     }
+    Ok(RestoreOutcome::Copied)
 }
 
-/// Link matching unit groups from the vault into a working dir.
+/// Restore matching unit groups from the vault into a working dir.
 ///
-/// `deps/` link outputs (`.rlib`, proc-macro `.so`) are hard-linked — rustc
-/// only ever replaces those atomically. Fingerprint state, build-script
-/// trees and `deps/*.rmeta` become private writable copies: rustc writes
-/// `.rmeta` in place, so a read-only link turns any rebuild of that unit
-/// into `output file … .rmeta is not writeable`. Hard links share the
-/// store's canonical stamp; private copies are stamped after copying. Never
-/// overwrites a file that already exists, never touches sources, and a
-/// partial vault is fine: Cargo recompiles whatever is missing.
+/// Every file is a private writable verified copy. Rustc requires writable
+/// `.rlib` and proc-macro `.so` output paths when recompiling, so sharing
+/// read-only vault inodes makes a restored view unusable. Copies are stamped
+/// after verification. Restore never overwrites a file that already exists,
+/// never touches sources, and a partial vault is fine: Cargo recompiles
+/// whatever is missing.
 ///
 /// `unit_filter` narrows by substring (`restore --unit`); `packages` narrows
 /// to a package set (`exec` passes the project's `Cargo.lock` packages, so a
@@ -1812,25 +1911,9 @@ pub fn restore_with(
                     continue;
                 }
             }
-            // Only link outputs (`.rlib`, proc-macro `.so`) may share the
-            // store inode — rustc replaces those atomically. `.rmeta` and
-            // everything else are written in place by rustc, cargo or build
-            // scripts: private verified copies only. Classic keeps link
-            // outputs in `deps/`; the new layout keeps them in `out/`.
-            let shared = if file.path.starts_with("deps/") {
-                !file.path.ends_with(".rmeta")
-            } else if file.path.contains("/out/") {
-                file.path.ends_with(".rlib") || file.path.ends_with(".so")
-            } else {
-                false
-            };
             if dry_run {
                 unit_touched = true;
-                if shared {
-                    report.files_linked += 1;
-                } else {
-                    report.files_copied += 1;
-                }
+                report.files_copied += 1;
                 report.bytes += file.size;
                 continue;
             }
@@ -1844,17 +1927,12 @@ pub fn restore_with(
                     eprintln!("restore: writing {}: {err:#}", dst.display());
                     continue;
                 }
-                match restore_file_at(view_root, &dest_rel, &src, entry.stamp, file, shared) {
+                match restore_file_at(view_root, &dest_rel, &src, entry.stamp, file) {
                     Ok(RestoreOutcome::Existing) => {
                         report.files_existing += 1;
                     }
                     Ok(RestoreOutcome::Missing) => {
                         report.files_missing += 1;
-                    }
-                    Ok(RestoreOutcome::Linked) => {
-                        report.files_linked += 1;
-                        report.bytes += file.size;
-                        unit_touched = true;
                     }
                     Ok(RestoreOutcome::Copied) => {
                         report.files_copied += 1;
@@ -1893,21 +1971,11 @@ pub fn restore_with(
                         continue;
                     }
                 }
-                let result = if shared {
-                    util::check_regular_chain(&units, &rel)
-                        .and_then(|_| verify_store_file(&src, file))
-                        .and_then(|_| fs::hard_link(&src, &dst).map_err(Into::into))
-                } else {
-                    util::check_regular_chain(&units, &rel)
-                        .and_then(|_| install_private_copy(&src, &dst, entry.stamp, file))
-                };
+                let result = util::check_regular_chain(&units, &rel)
+                    .and_then(|_| install_private_copy(&src, &dst, entry.stamp, file));
                 match result {
                     Ok(()) => {
-                        if shared {
-                            report.files_linked += 1;
-                        } else {
-                            report.files_copied += 1;
-                        }
+                        report.files_copied += 1;
                         report.bytes += file.size;
                         unit_touched = true;
                     }
@@ -2028,10 +2096,10 @@ fn install_private_copy(src: &Path, dst: &Path, stamp: u64, file: &FileEntry) ->
         .unwrap_or(0);
     let tmp = parent.join(format!(".epicenter-copy-{}-{nonce}", std::process::id()));
     util::copy_file_verified(src, &tmp, file.size, &file.sha256)?;
-    make_writable(&tmp)?;
+    make_writable(&tmp, file.execute_bits)?;
     set_stamp(&tmp, stamp)?;
-    // Private copies stay writable: rustc/cargo rewrite .rmeta and
-    // fingerprint state in place. Only shared `deps/` artifacts are 0444.
+    // Private copies stay writable: rustc and Cargo rewrite outputs and
+    // fingerprint state in place.
     // Link, never rename: this keeps "never overwrite an existing file".
     let installed = fs::hard_link(&tmp, dst);
     let _ = fs::remove_file(&tmp);
@@ -2673,7 +2741,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_links_hardlinks_and_never_overwrites() -> Result<()> {
+    fn restore_copies_and_never_overwrites() -> Result<()> {
         let build = tempfile::tempdir()?;
         let store = tempfile::tempdir()?;
         let view = tempfile::tempdir()?;
@@ -2691,10 +2759,9 @@ mod tests {
         assert_eq!(report.units_linked, 3);
         assert_eq!(report.files_existing, 1, "the live artifact was skipped");
         assert_eq!(fs::read(&occupied)?, b"live artifact");
-        // Only `deps/` artifacts are hard-linked; state and build trees are
-        // private copies (cargo writes both in place). The single deps/
-        // artifact of this fixture was the occupied one, so nothing linked.
-        assert_eq!(report.files_linked, 0, "no other deps/ artifact");
+        // Every recovered file is a private writable copy. The single deps/
+        // artifact of this fixture was occupied, so it remains untouched.
+        assert_eq!(report.files_linked, 0);
         assert!(report.files_copied >= 12, "got {}", report.files_copied);
 
         // Memo file content and hash landed in the right place.
@@ -2838,8 +2905,8 @@ mod tests {
             use std::os::unix::fs::MetadataExt;
             let rlib = root.join("out/libanyhow-9709d57b46b8d526.rlib");
             let rmeta = root.join("out/libanyhow-9709d57b46b8d526.rmeta");
-            assert!(fs::metadata(&rlib)?.nlink() >= 2, "rlib is a hard link");
-            assert_eq!(fs::metadata(&rmeta)?.nlink(), 1, "rmeta is a copy");
+            assert_eq!(fs::metadata(&rlib)?.nlink(), 1, "rlib is a private copy");
+            assert_eq!(fs::metadata(&rmeta)?.nlink(), 1, "rmeta is a private copy");
         }
         // The fixture's source unit survives untouched.
         assert!(unit.join("out/libanyhow-9709d57b46b8d526.rlib").is_file());
@@ -3065,6 +3132,29 @@ mod tests {
     }
 
     #[test]
+    fn harvest_skips_diagnostic_only_fingerprint_dirs() -> Result<()> {
+        let build = tempfile::tempdir()?;
+        let store = tempfile::tempdir()?;
+        synthetic_build_dir(build.path())?;
+        let fingerprint = build
+            .path()
+            .join("debug/.fingerprint/serde-102a33f055a8d229");
+        fs::remove_file(fingerprint.join("lib-serde"))?;
+        fs::write(
+            fingerprint.join("output-lib-serde"),
+            r#"{"$message_type":"diagnostic","message":"compile failed"}"#,
+        )?;
+
+        let report = harvest(build.path(), store.path(), Some("102a33f0"), false)?;
+        assert_eq!(report.stored, 0);
+        assert_eq!(report.skipped_incomplete, 1);
+
+        let manifest = load_manifest(store.path(), &parity_key()?)?.expect("manifest written");
+        assert!(manifest.units.is_empty(), "diagnostics never become a unit");
+        Ok(())
+    }
+
+    #[test]
     fn harvest_refreshes_when_a_role_drifted() -> Result<()> {
         let build = tempfile::tempdir()?;
         let store = tempfile::tempdir()?;
@@ -3092,10 +3182,14 @@ mod tests {
     }
 
     #[test]
-    fn restore_shares_artifacts_but_copies_state_writable() -> Result<()> {
+    fn restore_copies_artifacts_and_state_writable() -> Result<()> {
         let build = tempfile::tempdir()?;
         let store = tempfile::tempdir()?;
         synthetic_build_dir(build.path())?;
+        fs::write(
+            build.path().join("debug/deps/libserde-102a33f055a8d229.so"),
+            [8u8; 64],
+        )?;
         harvest(build.path(), store.path(), Some("102a33f0"), false)?;
 
         let view = tempfile::tempdir()?;
@@ -3110,7 +3204,13 @@ mod tests {
         let metadata = view
             .path()
             .join("debug/deps/libserde-102a33f055a8d229.rmeta");
-        assert!(state.is_file() && artifact.is_file() && metadata.is_file());
+        let dynamic_library = view.path().join("debug/deps/libserde-102a33f055a8d229.so");
+        assert!(
+            state.is_file()
+                && artifact.is_file()
+                && metadata.is_file()
+                && dynamic_library.is_file()
+        );
 
         let parity = parity_key()?;
         let manifest = load_manifest(store.path(), &parity)?.expect("manifest");
@@ -3121,20 +3221,38 @@ mod tests {
             .expect("stored unit");
         assert_eq!(ceil_secs(fs::metadata(&state)?.modified()?), entry.stamp);
 
-        // Rewriting restored state must not reach the store (the exact
-        // failure cargo hits when it stores a rebuilt fingerprint).
+        // Cargo and rustc rewrite state, rlibs, and proc-macro dynamic
+        // libraries in place. Restored copies must allow that without
+        // reaching the immutable store.
         fs::write(&state, "ffffffffffffffff")?;
+        fs::write(&artifact, b"rebuilt rlib")?;
+        fs::write(&dynamic_library, b"rebuilt dynamic library")?;
         let stored = units_dir(store.path(), &parity)
             .join("serde-102a33f055a8d229")
             .join("lib-serde");
+        let stored_artifact = units_dir(store.path(), &parity)
+            .join("serde-102a33f055a8d229")
+            .join("deps/libserde-102a33f055a8d229.rlib");
+        let stored_dynamic_library = units_dir(store.path(), &parity)
+            .join("serde-102a33f055a8d229")
+            .join("deps/libserde-102a33f055a8d229.so");
         assert_eq!(fs::read_to_string(&stored)?, "5d82713a7f2d05e2");
+        assert_eq!(fs::read(&stored_artifact)?, [7u8; 64]);
+        assert_eq!(fs::read(&stored_dynamic_library)?, [8u8; 64]);
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            assert!(
-                fs::metadata(&artifact)?.nlink() >= 2,
-                "artifact shares the store inode"
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&artifact)?.nlink(),
+                1,
+                "rlib is a private copy"
+            );
+            assert_eq!(
+                fs::metadata(&dynamic_library)?.nlink(),
+                1,
+                "dynamic library is a private copy"
             );
             assert_eq!(fs::metadata(&state)?.nlink(), 1, "state is a private copy");
             assert_eq!(
@@ -3142,7 +3260,83 @@ mod tests {
                 1,
                 ".rmeta is a private copy (rustc opens it for write)"
             );
+            assert_eq!(
+                fs::metadata(&state)?.permissions().mode() & 0o7777,
+                0o600,
+                "non-executable state is a private writable copy"
+            );
+            assert_eq!(
+                fs::metadata(&stored)?.permissions().mode() & 0o7777,
+                0o444,
+                "non-executable store state remains read-only"
+            );
         }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn harvest_and_restore_preserve_execute_bits_without_special_bits() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let build = tempfile::tempdir()?;
+        let store = tempfile::tempdir()?;
+        let view = tempfile::tempdir()?;
+        synthetic_build_dir(build.path())?;
+        let source = build
+            .path()
+            .join("debug/build/x-1122334455667788/build_script_build-1122334455667788");
+        fs::write(&source, b"#!/bin/sh\nexit 0\n")?;
+
+        harvest(build.path(), store.path(), Some("1122334455667788"), false)?;
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o7755))?;
+        let refreshed = harvest(build.path(), store.path(), Some("1122334455667788"), false)?;
+        assert_eq!(
+            refreshed.refreshed, 1,
+            "execution-bit drift refreshes a unit"
+        );
+
+        let parity = parity_key()?;
+        let manifest = load_manifest(store.path(), &parity)?.expect("manifest");
+        let entry = manifest
+            .units
+            .iter()
+            .find(|entry| entry.name == "x-1122334455667788")
+            .expect("build-script unit");
+        let file = entry
+            .files
+            .iter()
+            .find(|file| file.path.ends_with("build_script_build-1122334455667788"))
+            .expect("executable build script");
+        assert_eq!(file.execute_bits, 0o111);
+
+        let stored = units_dir(store.path(), &parity)
+            .join(&entry.name)
+            .join(&file.path);
+        assert_eq!(
+            fs::metadata(&stored)?.permissions().mode() & 0o7777,
+            0o555,
+            "the vault preserves execute bits while stripping special bits"
+        );
+
+        restore(
+            view.path(),
+            store.path(),
+            Some("1122334455667788"),
+            None,
+            false,
+        )?;
+        let restored = view.path().join("debug").join(&file.dest);
+        assert_eq!(
+            fs::metadata(&restored)?.permissions().mode() & 0o7777,
+            0o711,
+            "restored private copies preserve execute bits and stay writable"
+        );
+        assert!(
+            Command::new(&restored).status()?.success(),
+            "the restored executable runs"
+        );
         Ok(())
     }
 
@@ -3318,7 +3512,7 @@ mod tests {
         let mut perms = fs::metadata(&file)?.permissions();
         perms.set_readonly(true);
         fs::set_permissions(&file, perms)?;
-        make_writable(&file)?;
+        make_writable(&file, 0)?;
         set_stamp(&file, 1_700_000_100)?;
         assert_eq!(
             ceil_secs(fs::metadata(&file)?.modified()?),
@@ -3435,6 +3629,7 @@ mod tests {
                 size: 1,
                 sha256: String::new(),
                 role: "artifact".into(),
+                execute_bits: 0,
             }],
         };
         let base = Manifest {
@@ -3461,6 +3656,71 @@ mod tests {
             };
             assert!(manifest.validate().is_err(), "must reject {manifest:?}");
         }
+
+        let mut manifest = Manifest {
+            units: vec![unit("ok", "debug", "deps/x", "deps/x")],
+            ..base
+        };
+        manifest.units[0].files[0].execute_bits = 0o1000;
+        assert!(manifest.validate().is_err(), "must reject special bits");
+    }
+
+    #[test]
+    fn manifest_size_bound_is_shared_by_reads_and_writes() {
+        assert!(ensure_manifest_size(MANIFEST_MAX_BYTES).is_ok());
+        let error = ensure_manifest_size(MANIFEST_MAX_BYTES + 1).unwrap_err();
+        assert!(
+            error.to_string().contains("exceeding"),
+            "oversize manifests have a useful error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn load_manifest_accepts_signed_manifest_larger_than_legacy_config_limit() -> Result<()> {
+        const LEGACY_CONFIG_LIMIT: usize = 16 * 1024 * 1024;
+
+        let store = tempfile::tempdir()?;
+        let generation = "generation";
+        let manifest = Manifest {
+            parity_key: generation.into(),
+            toolchain: "test".into(),
+            created: 1,
+            updated: 1,
+            units: vec![],
+            mac: String::new(),
+        };
+        save_manifest(store.path(), generation, &manifest)?;
+
+        // Whitespace changes neither the parsed manifest nor its MAC body.
+        // It models the large, valid manifests real workspaces produce without
+        // needing thousands of fixture entries.
+        let path = manifest_path(store.path(), generation);
+        let mut file = fs::OpenOptions::new().append(true).open(&path)?;
+        file.write_all(&vec![b' '; LEGACY_CONFIG_LIMIT])?;
+        file.sync_all()?;
+        assert!(fs::metadata(&path)?.len() > LEGACY_CONFIG_LIMIT as u64);
+
+        let loaded = load_manifest(store.path(), generation)?.expect("manifest is readable");
+        assert_eq!(loaded.parity_key, generation);
+        Ok(())
+    }
+
+    #[test]
+    fn zero_execute_bits_do_not_change_legacy_file_entry_serialization() -> Result<()> {
+        let file = FileEntry {
+            path: "deps/x".into(),
+            dest: "deps/x".into(),
+            size: 1,
+            sha256: String::new(),
+            role: "artifact".into(),
+            execute_bits: 0,
+        };
+        assert_eq!(
+            serde_json::to_string(&file)?,
+            r#"{"path":"deps/x","dest":"deps/x","size":1,"sha256":"","role":"artifact"}"#,
+            "legacy manifest bytes stay stable for their HMAC"
+        );
+        Ok(())
     }
 
     #[test]
